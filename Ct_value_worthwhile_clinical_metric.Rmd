@@ -1,0 +1,556 @@
+---
+pdf_document:
+  toc: yes
+author: "Andrew D. Johnston"
+date: "08/31/2020"
+output:
+  html_document: null
+  css: styles.css
+  pdf_document: default
+title: "Is Cycle Threshold A Worthwhile Clinical Metric for SARS-CoV2?"
+editor_options:
+  chunk_output_type: console
+toc: yes
+toc_depth: 4
+word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+#getwd("/Users/andrew/Dropbox/COVID-19/research/")
+```
+
+Goals of Analysis
+
+1) Calculate the Ct value difference between Expired and Survivors for each Machine - Cepheid, Hologic, and Abbott
+2) Calculate the Youden index for each Machine - Cepheid, Hologic, and Abbott
+3) Examine the variability of samples taken within 48 hours of each other.
+4) Observe how many specimen pairs cross the Youden Index for their respective machine
+
+```{r packages, echo=TRUE, warning=FALSE, message = FALSE}
+# load in libraries
+library(data.table)
+library(ggplot2)
+library(ggthemes)
+library(reshape2)
+library(ggpubr)
+library(RColorBrewer)
+library(MASS)
+library(AER) 
+library(scales)
+library(Hmisc)
+library("flexplot")
+library(overlapping)
+library(lattice)
+library(lubridate)
+library(ROCit)
+library(pROC)
+library(plotROC)
+library(OptimalCutpoints)
+library(cutpointr)
+library(pastecs)
+
+# set options
+options(scipen=999, stringsAsFactors = FALSE)
+```
+
+Loading in the mortatlity data for each COVID specimen
+
+```{r mort-data-load, echo=TRUE, warning=FALSE, message = FALSE}
+mort_dat <- fread("Data_used/COVID_POS_SURVIVAL_short.csv",  header = T)
+mort_dat <- as.data.frame(mort_dat)
+dim(mort_dat)
+mort_dat$Alive <- "Survivor"
+mort_dat$Alive[mort_dat$`Patient Age`=="Deceased"] <- "Expired"
+mort_dat$Alive <- factor(mort_dat$Alive, levels = c("Survivor", "Expired"))
+```
+
+1a) Obtaining the CT differences between expired and survivor for Cephied Machine
+
+```{r cephied-ct, echo=TRUE, warning=FALSE, message = FALSE}
+cephied_dat <- fread("Data_used/sarsCoV2-cepheid_ct.csv", header = T)
+cephied_dat <- as.data.frame(cephied_dat)
+cephied_dat <- cephied_dat[1:11490,] # R read in all the empty rows
+cephied_dat <- cephied_dat[,-c(4,6,8)] # R read in all the empty rows
+colnames(cephied_dat) <- c("MRN", "Spec_ID", "Result", "Ct_E", "Ct_n", "Ct_Control","start_time")
+head(cephied_dat)
+dim(cephied_dat)
+
+# any with same spec ID - QC
+any(duplicated(cephied_dat$Spec_ID))
+
+# clear all negative and error and  
+filter_cepheid <-c("NEGATIVE","ERROR","INVALID", "NO RESULT")
+idx_cephied_filter <- grep(paste0(filter_cepheid, collapse = "|"), x = cephied_dat$Result, value = FALSE)
+length(idx_cephied_filter) #9589
+cephied_dat <- cephied_dat[-idx_cephied_filter,]
+table(cephied_dat$Result)
+# there are 11 samples in which the control probe did not result but they were deemed positive anyways, so I'll keep them
+cephied_dat[which(cephied_dat$Ct_Control==0),] 
+# head(cephied_dat[cephied_dat$Result=="SARS-CoV-2 PRESUMPTIVE POS",],50)
+# head(cephied_dat[which(cephied_dat$Ct_E==0),])
+# the presumptive positives were when E probe was positive but N probe was undetected
+# removing Ct_N value of 0 
+cephied_dat <- cephied_dat[-which(cephied_dat$Ct_n==0),]
+dim(cephied_dat) # 1828
+
+cephied_dat_mort <- merge(x=cephied_dat, y=mort_dat, by.x = "Spec_ID", by.y = "Specimen ID")
+dim(cephied_dat_mort) # lost two in the merge; 1826
+
+wilcox.test(cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Survivor"],cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Expired"], conf.int=TRUE)
+
+# 95 percent confidence interval:
+# 4.300053 6.299982
+# difference in location 
+#              5.299954 
+
+median(cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Survivor"])-median(cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Expired"])
+mean(cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Survivor"])-mean(cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Expired"])
+
+
+colorBlindBlack8  <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                       "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+pie(rep(1, 8), col = colorBlindBlack8)
+
+dark_col <- brewer.pal(6,"Dark2")
+fig_ct_method_cephied <- ggplot(cephied_dat_mort, aes(x=Alive, y=Ct_n, fill=Alive)) + 
+geom_dotplot(binaxis='y', stackdir='center', stackratio=.5, dotsize=.25, col=NA, position = position_jitterd(width = .05, height = 1, quad.points = 1, seed = 7)) +
+  theme_minimal() + 
+  scale_fill_manual(values=colorBlindBlack8[c(4,6)]) +
+  stat_summary(data = cephied_dat_mort, mapping = aes(x=as.numeric(as.factor((Alive))), y=Ct_n), fun.y= "median", geom="point", color=colorBlindBlack8[7], inherit.aes = FALSE, shape = 95, size=20) +
+  xlab("")+
+  ylab("Ct Value") +
+  ylim(c(0,50))
+fig_ct_method_cephied
+#ggsave(plot = fig_ct_method_cephied, filename = "Fig1_cephied.pdf", width=4.5, height=3, useDingbats=FALSE)
+
+# plot AUC overlap between survivor and expired
+AUC_overlap_cephied <- list(Survivor=cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Survivor"], Expired=cephied_dat_mort$Ct_n[cephied_dat_mort$Alive=="Expired"])
+AUC_overlap_plot_cephied <- overlap(AUC_overlap_cephied, plot=TRUE, theme = theme_minimal)
+
+fig_ct_overlap_cephied <- ggplot(AUC_overlap_plot_cephied$DD, aes(x,y1)) +
+  geom_ribbon(aes(ymin=0,ymax=y2),alpha=.3,fill=colorBlindBlack8[c(6)])+
+  geom_ribbon(aes(ymin=0,ymax=y1),alpha=.3,fill=colorBlindBlack8[c(4)])+
+  xlab("Cycle Threshold")+
+  xlim(c(0,50)) +
+  ylab("") +
+  theme_minimal()+
+  ylim(c(0,0.08))+
+  ggtitle(paste0("Overlap = ",round(AUC_overlap_plot_cephied$OV*100,2),"%"))
+fig_ct_overlap_cephied
+#ggsave(plot = fig_ct_overlap_cephied, filename = "Fig1_overlap_cephied.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+```
+
+2a) Obtaining the Youden Index for the Cephied machine
+
+```{r cephied-roc, echo=TRUE, warning=FALSE, message = FALSE}
+
+rocfit_cepheid <- pROC::roc(cephied_dat_mort$Alive, cephied_dat_mort$Ct_n)
+pROC::auc(rocfit_cepheid)
+youden_coord_cephied<- pROC::coords(rocfit_cepheid, x = "b")
+summary(cephied_dat_mort$Ct_n)
+rocplot_cepheid <- ggplot(cephied_dat_mort, aes(m = Ct_n, d = Alive)) + 
+  geom_roc(n.cuts=0)
+rocplot_cepheid <- rocplot_cepheid + style_roc(theme = theme_minimal, xlab = "1 - Specificity", ylab = "Sensitivity") +
+  annotate("text", x = .75, y = .25, 
+           label = paste("AUC =", round(calc_auc(rocplot_cepheid)$AUC, 2)))  +
+  geom_point(aes(x=1-youden_coord_cephied$specificity, y=youden_coord_cephied$sensitivity), colour="red")+
+  geom_abline(slope=1, intercept=0, lty="dashed")
+  #ggtitle("Cepheid ROC")
+rocplot_cepheid
+#ggsave(plot = rocplot_cepheid, filename = "Fig1_roc_cephied.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+```
+
+1b) Obtaining the CT differences between expired and survivor for Hologic Machine
+
+```{r hologic-ct, echo=TRUE, warning=FALSE, message = FALSE}
+hologic_dat <- fread("Copy of pcrbase.csv", header = T)
+hologic_dat <- as.data.frame(hologic_dat)
+dim(hologic_dat) #16732
+
+#sanity check- duplicated specimen IDs?
+any(duplicated(hologic_dat$Spec_name))
+sum(duplicated(hologic_dat$Spec_name)) #412
+
+#removing duplicates
+hologic_dat <- hologic_dat[!duplicated(hologic_dat$Spec_name),]
+
+# sort based on MRN then time collected
+hologic_dat <- hologic_dat[order(hologic_dat$mrn),]
+
+# making MRN numeric 
+hologic_dat$mrn <- as.numeric(hologic_dat$mrn)
+
+# remove the hologi as well as NA MRN patients
+hologic_dat <- hologic_dat[-c(1:2),]
+sum(is.na(hologic_dat$mrn)) #130
+hologic_dat <- hologic_dat[!is.na(hologic_dat$mrn),]
+
+#removing negative tests
+table(hologic_dat$Result)
+hologic_dat <- hologic_dat[hologic_dat$Result=="POS",]
+
+#QC 
+table(hologic_dat$IC_valid)
+summary(hologic_dat$Control_Ct) 
+dim(hologic_dat)
+hologic_dat_mort <- merge(x=hologic_dat, y=mort_dat, by.x = "Spec_name", by.y = "Specimen ID")
+dim(hologic_dat_mort)
+
+wilcox.test(hologic_dat_mort$Ct[hologic_dat_mort$Alive=="Survivor"],hologic_dat_mort$Ct[hologic_dat_mort$Alive=="Expired"], conf.int=TRUE)
+
+# 95 percent confidence interval:
+# 3.499936 5.000038
+# sample estimates:
+# difference in location 
+#              4.299973
+
+fig_ct_method_hologic <- ggplot(hologic_dat_mort, aes(x=Alive, y=Ct, fill=Alive)) + 
+geom_dotplot(binaxis='y', stackdir='center', stackratio=.5, dotsize=.17, col=NA, position = position_jitterd(width = .05, height = 1, quad.points = 1, seed = 7)) +
+  theme_minimal() + 
+  scale_fill_manual(values=colorBlindBlack8[c(4,6)]) +
+  stat_summary(data = hologic_dat_mort, mapping = aes(x=as.numeric(as.factor((Alive))), y=Ct), fun.y= "median", geom="point", color=colorBlindBlack8[7], inherit.aes = FALSE, shape = 95, size=20) +
+  xlab("")+
+  ylab("Ct Value") +
+  ylim(c(0,50))
+fig_ct_method_hologic
+#ggsave(plot = fig_ct_method_hologic, filename = "Fig1_hologic.pdf", width=4.5, height=3, useDingbats=FALSE)
+
+# plot AUC overlap between survivor and expired
+AUC_overlap_hologic <- list(Survivor=hologic_dat_mort$Ct[hologic_dat_mort$Alive=="Survivor"], Expired=hologic_dat_mort$Ct[hologic_dat_mort$Alive=="Expired"])
+AUC_overlap_plot_hologic <- overlap(AUC_overlap_hologic, plot=TRUE)
+
+fig_ct_overlap_hologic <- ggplot(AUC_overlap_plot_hologic$DD, aes(x,y1)) +
+  geom_ribbon(aes(ymin=0,ymax=y2),alpha=.3,fill=colorBlindBlack8[c(6)])+
+  geom_ribbon(aes(ymin=0,ymax=y1),alpha=.3,fill=colorBlindBlack8[c(4)])+
+  xlab("Cycle Threshold")+
+  xlim(c(0,50)) +
+  ylab("") +
+  ylim(c(0,0.08))+
+  theme_minimal()+
+  ggtitle(paste0("Overlap = ",round(AUC_overlap_plot_hologic$OV*100,2),"%"))
+fig_ct_overlap_hologic
+#ggsave(plot = fig_ct_overlap_hologic, filename = "Fig1_overlap_hologic.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+
+```
+
+2b) Obtaining the Youden Index for the Hologic machine
+
+
+```{r hologic-roc, echo=TRUE, warning=FALSE, message = FALSE}
+
+rocfit_hologic <- pROC::roc(as.character(hologic_dat_mort$Alive), hologic_dat_mort$Ct)
+pROC::auc(rocfit_hologic)
+youden_coord_hologic<- pROC::coords(rocfit_hologic, x = "b")
+youden_coord_hologic
+rocplot_hologic<- ggplot(hologic_dat_mort, aes(m = Ct, d = Alive)) + 
+  geom_roc(n.cuts=0)
+rocplot_hologic <- rocplot_hologic + style_roc(theme = theme_minimal, xlab = "1 - Specificity", ylab = "Sensitivity") +
+  annotate("text", x = .75, y = .25, 
+           label = paste("AUC =", round(calc_auc(rocplot_hologic)$AUC, 2)))  +
+  geom_point(aes(x=1-youden_coord_hologic$specificity, y=youden_coord_hologic$sensitivity), colour="red")+
+  geom_abline(slope=1, intercept=0, lty="dashed")
+  #ggtitle("Hologic ROC")
+rocplot_hologic
+#ggsave(plot = rocplot_hologic, filename = "Fig1_roc_hologic.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+```
+
+1c) Obtaining the CT differences between expired and survivor for Hologic Machine
+
+```{r abbott-ct, echo=TRUE, warning=FALSE, message = FALSE}
+abbott_dat <- fread("Ct_study_race.csv", header = T)
+abbott_dat <- as.data.frame(abbott_dat)
+dim(abbott_dat)
+
+# sanity checks 
+## are there duplicates? No
+any(duplicated(abbott_dat$MR)) # FALSE
+any(duplicated(abbott_dat$`Specimen ID`)) # FALSE
+
+# how many samples don't have a CT value
+sum(is.na(abbott_dat$Ct)) # 2
+#  How many samples have ct of 0? 
+sum(abbott_dat$Ct==0, na.rm = TRUE) # 1
+
+# I'm removing these four  samples
+abbott_dat <- abbott_dat[!(is.na(abbott_dat$Ct)) & !(abbott_dat$Ct==0),]
+dim(abbott_dat)
+
+# remove unecessary columns (Patient Name, Component, Column 3, method)
+colnames(abbott_dat)
+abbott_dat <- abbott_dat[,-c(3:4,7,21:27)]
+
+# only using Abbott data points
+abbott_dat <-subset(abbott_dat, `Method Abbr`=="m2000")
+dim(abbott_dat)
+
+# sort based on MRN then time collected
+abbott_dat <- abbott_dat[order(abbott_dat$MR),]
+
+# making MRN numeric 
+abbott_dat$MR <- as.numeric(abbott_dat$MR)
+sum(is.na(abbott_dat$mrn))
+
+table(abbott_dat$Value)
+summary(abbott_dat$Ct)
+
+#combining with mortaility data
+dim(abbott_dat)
+abbott_dat_mort <- merge(x=abbott_dat, y=mort_dat, by.x = "Specimen ID", by.y = "Specimen ID")
+dim(abbott_dat_mort) # all were kept :-)
+colnames(abbott_dat_mort)[22] <- "Alive"
+
+wilcox.test(abbott_dat_mort$Ct[abbott_dat_mort$Alive=="Survivor"],abbott_dat_mort$Ct[abbott_dat_mort$Alive=="Expired"], conf.int=TRUE)
+
+# 95 percent confidence interval:
+# 1.059992 2.669944
+# sample estimates:
+# difference in location 
+#              1.859981 
+
+fig_ct_method_abbott <- ggplot(abbott_dat_mort, aes(x=Alive, y=Ct, fill=Alive)) + 
+geom_dotplot(binaxis='y', stackdir='center', stackratio=.5, dotsize=.25, col=NA, position = position_jitterd(width = .05, height = 1, quad.points = 1, seed = 7)) +
+  theme_minimal() + 
+  scale_fill_manual(values=colorBlindBlack8[c(4,6)]) +
+  stat_summary(data = abbott_dat_mort, mapping = aes(x=as.numeric(as.factor((Alive))), y=Ct), fun.y= "median", geom="point", color=colorBlindBlack8[7], inherit.aes = FALSE, shape = 95, size=20) +
+  xlab("")+
+  ylab("Ct Value") +
+  ylim(c(0,50))
+fig_ct_method_abbott
+#ggsave(plot = fig_ct_method_abbott, filename = "Fig1_abbott.pdf", width=4.5, height=3, useDingbats=FALSE)
+
+
+# plot AUC overlap between survivor and expired
+AUC_overlap_abbott <- list(Survivor=abbott_dat_mort$Ct[abbott_dat_mort$Alive=="Survivor"], Expired=abbott_dat_mort$Ct[abbott_dat_mort$Alive=="Expired"])
+AUC_overlap_plot_abbott <- overlap(AUC_overlap_abbott, plot=TRUE, theme = theme_minimal)
+
+fig_ct_overlap_abbott <- ggplot(AUC_overlap_plot_abbott$DD, aes(x,y1)) +
+  geom_ribbon(aes(ymin=0,ymax=y2),alpha=.3,fill=colorBlindBlack8[c(6)])+
+  geom_ribbon(aes(ymin=0,ymax=y1),alpha=.3,fill=colorBlindBlack8[c(4)])+
+  xlab("Cycle Threshold")+
+  xlim(c(0,50)) +
+  ylab("") +
+  ylim(c(0,0.08))+
+  theme_minimal()+
+  ggtitle(paste0("Overlap = ",round(AUC_overlap_plot_abbott$OV*100,2),"%"))
+fig_ct_overlap_abbott
+#ggsave(plot = fig_ct_overlap_abbott, filename = "Fig1_overlap_abbott.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+```
+
+2c) Obtaining the Youden Index for the Abbott machine
+
+```{r abbott-roc, echo=TRUE, warning=FALSE, message = FALSE}
+
+rocfit_abbott <- pROC::roc(as.character(abbott_dat_mort$Alive), abbott_dat_mort$Ct)
+pROC::auc(rocfit_abbott)
+youden_coord_abbott<- pROC::coords(rocfit_abbott, x = "b")
+youden_coord_abbott
+rocplot_abbott<- ggplot(abbott_dat_mort, aes(m = Ct, d = Alive)) + 
+  geom_roc(n.cuts=0)
+rocplot_abbott <- rocplot_abbott + style_roc(theme = theme_minimal, xlab = "1 - Specificity", ylab = "Sensitivity") +
+  annotate("text", x = .75, y = .25, 
+           label = paste("AUC =", round(calc_auc(rocplot_abbott)$AUC, 2)))  +
+  geom_point(aes(x=1-youden_coord_abbott$specificity, y=youden_coord_abbott$sensitivity), colour="red")+
+  geom_abline(slope=1, intercept=0, lty="dashed")
+  #ggtitle("abbott ROC")
+rocplot_abbott
+#ggsave(plot = rocplot_abbott, filename = "Fig1_roc_abbott.pdf", width=2.5, height=2.5, useDingbats=FALSE)
+```
+
+3) Examine the variability of samples taken within 48 hours of each other. reading and curating data from pairs of Ct value from Abbott and Cephied 
+
+```{r pairs-data, echo=TRUE, warning=FALSE, message = FALSE}
+pairs_dat <- fread("Data_used/within_48.csv", header = T)
+pairs_dat <- as.data.frame(pairs_dat)
+dim(pairs_dat) #93 9
+
+# how many different machines
+table(pairs_dat$Method)
+
+#sanity check- duplicated specimen IDs?
+any(duplicated(pairs_dat$Spec_name)) # FALSE
+
+#parsing the date and time information
+pairs_dat$collect_parse <- parse_date_time(pairs_dat$Collected, orders="m/d/y H:M p")
+
+# sort based on MRN then time collected
+pairs_dat <- pairs_dat[order(pairs_dat$mrn, pairs_dat$collect_parse),]
+
+# how many patients have more than 2 samples? # two have 3, one has 5
+table(table(pairs_dat$mrn))
+
+# split into list
+split_pairs <- split(pairs_dat, pairs_dat$mrn)
+
+pairs_df <- data.frame() 
+j<-1
+for (i in 1:length(split_pairs)){
+  if(nrow(split_pairs[[i]])<3){
+    pairs_df[j,1] <- split_pairs[[i]]$mrn[1]
+    pairs_df[j,2] <- diff(split_pairs[[i]]$Ct)
+    pairs_df[j,3] <- as.numeric(difftime(split_pairs[[i]]$collect_parse[2],split_pairs[[i]]$collect_parse[1], units="hours"))
+    pairs_df[j,4] <- split_pairs[[i]]$Age[1]
+    pairs_df[j,5] <- split_pairs[[i]]$Sex[1]
+    pairs_df[j,6] <- split_pairs[[i]]$Method[1]
+    pairs_df[j,7] <- (split_pairs[[i]]$Method[1]==split_pairs[[i]]$Method[2])
+    pairs_df[j,8] <- split_pairs[[i]]$Ct[1]
+    pairs_df[j,9] <- split_pairs[[i]]$Ct[2]
+    pairs_df[j,10] <- mean(split_pairs[[i]]$Ct)
+    pairs_df[j,11] <- split_pairs[[i]]$collect_parse[1]
+    j<- j+1
+  }
+  else {
+    for (k in 2:nrow(split_pairs[[i]])){
+      pairs_df[j,1] <- split_pairs[[i]]$mrn[1]
+      pairs_df[j,2] <- split_pairs[[i]]$Ct[k] - split_pairs[[i]]$Ct[1]
+      pairs_df[j,3] <- as.numeric(difftime(split_pairs[[i]]$collect_parse[k],split_pairs[[i]]$collect_parse[1], units="hours"))
+      pairs_df[j,4] <- split_pairs[[i]]$Age[1]
+      pairs_df[j,5] <- split_pairs[[i]]$Sex[1]
+      pairs_df[j,6] <- split_pairs[[i]]$Method[k]
+      pairs_df[j,7] <- (split_pairs[[i]]$Method[1]==split_pairs[[i]]$Method[k])
+      pairs_df[j,8] <- split_pairs[[i]]$Ct[1]
+      pairs_df[j,9] <- split_pairs[[i]]$Ct[k]
+      pairs_df[j,10] <- (split_pairs[[i]]$Ct[1]+split_pairs[[i]]$Ct[k])/2
+      pairs_df[j,11] <- split_pairs[[i]]$collect_parse[1]
+      j<- j+1
+    }
+  }
+}
+colnames(pairs_df)<-c("MR", "CT_diff", "Time_diff", "Age", "Sex", "Method", "Method_match", "CT1", "CT2", "CT_mean", "first_collect_date") 
+
+#QC on Method matching
+any(!pairs_df$Method_match)
+
+# how many in first 24 hours 
+sum(length(pairs_df$CT_diff[pairs_df$Time_diff<24])) #19 in first 24 hours
+
+sort(pairs_df$first_collect_date[pairs_df$Time_diff<48]) #7/40 are after May
+hist(pairs_df$first_collect_date[pairs_df$Time_diff<48], "months", freq = TRUE)
+pairs_df$first_collect_date
+
+```
+
+plotting the pair with time on x, CT diff on y, fill by method
+```{r plot-pairs, echo=TRUE, warning=FALSE, message = FALSE}
+
+# color scheme
+dark_col <- brewer.pal(6,"Dark2")
+
+# layering in CT differences for each machine
+# Cephied 5.299954
+# Hologic 4.299973
+# Abbott  1.859981
+ggplot(data=pairs_df, aes(x=Time_diff, y=CT_diff, col=Method))+
+  annotate("rect", xmin = 0, xmax = 48, ymin = -1.859981, ymax = 1.859981,
+        alpha = .3, fill=dark_col[1]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = 1.859981, ymax = 4.299973,
+        alpha = .3, fill=dark_col[3]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = -1.859981, ymax = -4.299973,
+        alpha = .3, fill=dark_col[3]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = 4.299973, ymax = 5.299954,
+        alpha = .3, fill=dark_col[2]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = -4.299973, ymax = -5.299954,
+        alpha = .3, fill=dark_col[2]) +
+  geom_point()+
+  theme_minimal() +
+  scale_color_manual(values=dark_col)+
+  xlab("Hours since first swab")+
+  ylab("Difference in Ct Value")+
+  xlim(c(0,48)) +
+  ggtitle("Swab intrasample variability within first 48 hours,\nshaded areas corresponding to Ct Diff btwn mortality for each method")
+```
+
+4) Observe how many specimen pairs cross the Youden Index for their respective machine
+```{r youden-pairs, echo=TRUE, warning=FALSE, message = FALSE}
+# grabbing only those pairs within 48 hours
+pairs_df_48<- pairs_df[pairs_df$Time_diff<48,]
+dim(pairs_df_48)
+
+# Abbott 
+## number of pairs
+sum(pairs_df_48$Method=="Abbott") #8
+## number cross threshold
+sum((pairs_df_48$CT1[pairs_df_48$Method=="Abbott"]<youden_coord_abbott$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Abbott"]>youden_coord_abbott$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Abbott"]>youden_coord_abbott$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Abbott"]<youden_coord_abbott$threshold)) #3
+idx_abbott_youden <- which((pairs_df_48$CT1[pairs_df_48$Method=="Abbott"]<youden_coord_abbott$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Abbott"]>youden_coord_abbott$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Abbott"]>youden_coord_abbott$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Abbott"]<youden_coord_abbott$threshold)) #3
+
+# Cepheid 
+## number of pairs
+sum(pairs_df_48$Method=="Cephied") #14
+## number cross threshold
+sum((pairs_df_48$CT1[pairs_df_48$Method=="Cephied"]<youden_coord_cephied$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Cephied"]>youden_coord_cephied$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Cephied"]>youden_coord_cephied$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Cephied"]<youden_coord_cephied$threshold)) #2
+idx_Cephied_youden <- which((pairs_df_48$CT1[pairs_df_48$Method=="Cephied"]<youden_coord_cephied$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Cephied"]>youden_coord_cephied$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Cephied"]>youden_coord_cephied$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Cephied"]<youden_coord_cephied$threshold)) #3
+# Hologic 
+## number of pairs
+sum(pairs_df_48$Method=="Hologic") #18
+## number cross threshold
+sum((pairs_df_48$CT1[pairs_df_48$Method=="Hologic"]<youden_coord_hologic$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Hologic"]>youden_coord_hologic$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Hologic"]>youden_coord_hologic$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Hologic"]<youden_coord_hologic$threshold)) #3
+
+idx_holo_youden <- which((pairs_df_48$CT1[pairs_df_48$Method=="Hologic"]<youden_coord_hologic$threshold &
+       pairs_df_48$CT2[pairs_df_48$Method=="Hologic"]>youden_coord_hologic$threshold) | 
+      (pairs_df_48$CT1[pairs_df_48$Method=="Hologic"]>youden_coord_hologic$threshold &
+         pairs_df_48$CT2[pairs_df_48$Method=="Hologic"]<youden_coord_hologic$threshold)) #3
+
+
+
+pairs_df_48$CT1[pairs_df_48$Method=="Hologic"][idx_holo_youden]
+
+## highlighting the pairs which crossed the Youden index 
+pairs_df_48$`Crossed Youden` <- "No"
+pairs_df_48$`Crossed Youden`[pairs_df_48$Method=="Abbott"][idx_abbott_youden] <- "Yes"
+pairs_df_48$`Crossed Youden`[pairs_df_48$Method=="Cephied"][idx_Cephied_youden] <- "Yes"
+pairs_df_48$`Crossed Youden`[pairs_df_48$Method=="Hologic"][idx_holo_youden] <- "Yes"
+
+#What is the mortality status of Crossed Youden samples?
+crossed_pairs <- pairs_df_48[pairs_df_48$`Crossed Youden`=="Yes",]
+crossed_pairs$direction <- ifelse(crossed_pairs$CT_diff>0, "up", "down")
+idx_crossed_youden <- which(mort_dat$MRN %in% pairs_df_48[pairs_df_48$`Crossed Youden`=="Yes",1])
+mort_dat[idx_crossed_youden,]
+
+# layering in CT differences for each machine
+# Cephied 5.299954
+# Hologic 4.299973
+# Abbott  1.859981
+Cross_youden_plot <- ggplot(data=pairs_df_48, aes(x=Time_diff, y=CT_diff, col=Method, size=`Crossed Youden`, shape=`Crossed Youden`))+
+  annotate("rect", xmin = 0, xmax = 48, ymin = -1.859981, ymax = 1.859981,
+        alpha = .3, fill=dark_col[1]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = 1.859981, ymax = 4.299973,
+        alpha = .3, fill=dark_col[3]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = -1.859981, ymax = -4.299973,
+        alpha = .3, fill=dark_col[3]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = 4.299973, ymax = 5.299954,
+        alpha = .3, fill=dark_col[2]) +
+  annotate("rect", xmin = 0, xmax = 48, ymin = -4.299973, ymax = -5.299954,
+        alpha = .3, fill=dark_col[2]) +
+  geom_point()+
+  theme_minimal() +
+  scale_size_discrete(range = c(1.5, 3))+
+  scale_color_manual(values=dark_col)+
+  xlab("Hours since first swab")+
+  ylab("Difference in Ct Value")+
+  xlim(c(0,48)) +
+  ggtitle("Swab intrasample variability within first 48 hours,\nshaded areas corresponding to Ct Diff btwn mortality for each method")
+Cross_youden_plot
+#ggsave(plot = Cross_youden_plot, filename = "Fig2_youden_cross.pdf", width=6.5, height=4, useDingbats=FALSE)
+
+```
+Out of the 40 pairs, 8 crossed the youden index point for predicting mortality (20%). Lending evidence to being cautionary when using Ct value to predict mortality. 
+
+Session Information:
+```{r session-Info, echo=TRUE, warning=FALSE, message = FALSE}
+sessionInfo()
+```
